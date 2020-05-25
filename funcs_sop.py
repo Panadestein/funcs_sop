@@ -10,6 +10,7 @@ import numpy as np
 from numpy.polynomial import chebyshev as cheby
 from scipy.optimize import approx_fprime as grad_diff
 import tensorly as tl
+import tensorly.tenalg as tlalg
 
 # Define a fancy timer class decorator
 
@@ -31,13 +32,15 @@ class ArtDeco:
             return res
         return timed
 
+
 # Define the SopFunc class
 
 
 class SopFbr:
     """
     Class that holds the SOP-FBR function and its gradients
-    with respect to the variables and parameters.
+    with respect to the variables and parameters. A RMSE like
+    cost function is also defined
 
     Parameters
     ==========
@@ -52,25 +55,30 @@ class SopFbr:
            series coefficients with the core tensor, both flattened. The
            order of the Chebyshev coefficients is given by the order of the
            DOFs in the core tensor.
+    refdata : array
+            Array of shape (N, f + 1) containing the reference
+            geometries (points of the DVR) and corresponding energies.
+            Required only if the gradient of the parameters is requested.
     """
 
-    def __init__(self, chebdim, gdim, carray):
+    def __init__(self, chebdim, gdim, carray, refdata=None):
         self.chebdim = chebdim
         self.gdim = gdim
         self.carray = carray
+        self.refdata = refdata
 
         # Total number of Chebyshev coefficients
         self.ncheb = np.sum(self.gdim) * self.chebdim
 
         # Creates the Chebyshev coefficient's tensor
-        self._chebs_tk = np.array(
-            np.split(self.carray[:self.ncheb],
-                     self.carray[:self.ncheb].shape[0] / self.chebdim))
+        chebs_tk = np.array(
+            np.split(carray[:self.ncheb],
+                     carray[:self.ncheb].shape[0] / self.chebdim))
         self.chebs = np.array(
-            np.split(self._chebs_tk, np.cumsum(self.gdim))[0:-1])
+            np.split(chebs_tk, np.cumsum(self.gdim))[0:-1])
 
         # Creates the core tensor
-        self.cora = self.carray[self.ncheb:].reshape(self.gdim)
+        self.cora = carray[self.ncheb:].reshape(self.gdim)
 
     def sop_fun(self, q_array):
         """
@@ -151,7 +159,20 @@ class SopFbr:
 
         return vargrad
 
-    def sop_pargrad(self):
+    def rho(self):
+        """
+        Computes the value of the Root Mean Square cost function
+        """
+        dvrvals = self.refdata[:, :-1]
+        e_ref = self.refdata[:, -1]
+        e_sop = []
+        for geo in dvrvals:
+            e_sop.append(self.sop_fun(geo))
+        e_sop = np.array(e_sop).flatten()
+        return np.sqrt(np.mean((e_sop - e_ref) ** 2))
+
+    @ArtDeco.timethis
+    def sop_pargrad(self, q_array):
         """
         Computes the gradient of the SOPFBR function with respect
         to the parameters
@@ -167,7 +188,60 @@ class SopFbr:
 
         pargrad : array
                 Parameter's gradient in the selected point
+
+        Notes
+        =====
+
+        The derivatives of the Core tensor are fairly straightforward: they
+        reduce to the Kronecker product of the SPPs. Chebyshev coefficients
+        derivatives are a bit trickier. The key is that only the corresponding
+        pure Chebyshev polynomial survives after differentiation.
+        That is why the pure Chebyshev are computed in the main loop.
         """
+        # Generates the matrices (or vectors) of the SPPs and pure Chebs
+        v_matrices = []
+        v_chebpure = []
+        for kdof, m_kp in enumerate(self.gdim):
+            v_ch = np.zeros(self.chebdim)
+            coeff = [1]
+            for miu in np.arange(self.chebdim):
+                v_ch[miu] = cheby.chebval(q_array[kdof], coeff)
+                coeff.insert(0, 0)
+
+            v_kp = np.zeros(m_kp)
+            for j_kp in np.arange(m_kp):
+                v_kp[j_kp] = cheby.chebval(
+                    q_array[kdof], self.chebs[kdof][j_kp])
+
+            v_chebpure.append(v_ch)
+            v_matrices.append(v_kp)
+
+        v_chebpure = np.array(v_chebpure)
+        v_matrices = np.array(v_matrices)
+
+        # Core coefficients derivatives
+
+        coreders = tlalg.kronecker(v_matrices)
+
+        # Chebyshev coefficients derivatives
+
+        chebders = np.zeros(self.ncheb)
+        idxs = 0
+        for kdof, m_kp in enumerate(self.gdim):
+            for j_kp in np.arange(m_kp):
+                matrices = np.copy(v_matrices)
+                lonelycheb = np.zeros(m_kp)
+                lonelycheb[j_kp] = v_chebpure[kdof, j_kp]
+                matrices[kdof] = lonelycheb
+                chebders[idxs] = tl.tucker_tensor.tucker_to_tensor(
+                    (self.cora, matrices))
+                idxs += 1
+
+        # Concatenate results
+
+        pargrad = np.concatenate((chebders, coreders))
+
+        return pargrad
 
 
 if __name__ == "__main__":
@@ -175,12 +249,17 @@ if __name__ == "__main__":
     GDIM = np.array([5, 5, 5, 5, 5, 5])
     CARRAY = np.loadtxt('params_init')
     QARR = np.array([2.6, 1.8, 2.2, 1.7, 1.9, np.pi])
+    DATA = np.loadtxt('ref_ab')
 
-    sop_hono = SopFbr(CHEBDIM, GDIM, CARRAY)
+    sop_hono = SopFbr(CHEBDIM, GDIM, CARRAY, DATA)
+
     print(sop_hono.sop_fun(QARR))
     print(sop_hono.sop_vargrad(QARR))
+    print(sop_hono.sop_pargrad(QARR))
     T0 = time.time()
     grad_diff(QARR, sop_hono.sop_fun, 1e-7)
     TF = time.time()
-    print(f"Nurical gradient in {TF - T0} s")
+    print(f"Numerical gradient in {TF - T0} s")
     print(grad_diff(QARR, sop_hono.sop_fun, 1e-7))
+
+    print(sop_hono.rho())
