@@ -2,7 +2,7 @@
 This module contains a class with the definition of the SOP-FBR function
 and its corresponding gradients, both with respect to the variables
 and the parameters. The first one of these gradients is useful to
-obtain the minium of the function, whereas the second one comes very
+obtain the minimum of the function, whereas the second one comes very
 handy in the optimization of the parameters.
 """
 import time
